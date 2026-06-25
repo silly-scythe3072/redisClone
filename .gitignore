@@ -1,0 +1,6 @@
+mini-redis
+benchmark
+redis.wal
+redis.snap
+*.o
+.vscode/
