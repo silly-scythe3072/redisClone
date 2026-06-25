@@ -1,15 +1,14 @@
 # redisClone
 
-!\[C++](https://img.shields.io/badge/C++-17-blue?style=flat-square\&logo=cplusplus)
-!\[Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2-lightgrey?style=flat-square)
-!\[License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-A lightweight, multithreaded key-value store written in C++ to practice core networking and data structures.
-Implements TCP networking, LRU eviction, TTL expiry, WAL-based crash recovery,
-and snapshot persistence — all from first principles.
+![C++](https://img.shields.io/badge/C++-17-blue?style=flat-square&logo=cplusplus) 
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2-lightgrey?style=flat-square) 
+![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+
+A lightweight, multithreaded key-value store written in C++ to practice core networking and data structures. Implements TCP networking, LRU eviction, TTL expiry, WAL-based crash recovery, and snapshot persistence — all from first principles.
 
 I am using this project to apply my Data Structures and Algorithms (DSA) knowledge to a real-world system. It demonstrates how to handle multiple concurrent clients, manage memory efficiently, and implement custom data storage from the ground up.
-\---
 
+---
 ## Architecture
 
 ```mermaid
