@@ -1,20 +1,23 @@
 /*
- * Core TCP Server implementation.
- * Handles socket creation, network binding, and the main event loop for client connections.
+ * Core TCP Server implementation for Windows.
+ * Handles Winsock initialization, network binding, and the multithreaded event loop.
  */
 #include <iostream>
 #include <string>
 #include <sstream>
 #include <vector>
 #include <algorithm>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include "store.h"
 #include <thread>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include "store.h"
 #include "wal.h"
-#include "snapshot.h"
+#include "persistence.h"
+
+// Directs the MSVC/MinGW compiler to link the Windows Socket library
+#pragma comment(lib, "Ws2_32.lib")
+
 using namespace std;
 
 #define PORT 6379
@@ -38,6 +41,7 @@ string handleCommand(Store &db, WAL &wal, const string &raw)
     string cmd = p[0];
     for (auto &c : cmd)
         c = toupper(c);
+        
     if (cmd == "PING")
         return "+PONG\r\n";
 
@@ -55,8 +59,8 @@ string handleCommand(Store &db, WAL &wal, const string &raw)
                 ttl = stoi(p[4]);
         }
         db.set(p[1], p[2], ttl);
-        // log to WAL before returning — if we crash after set() but before log(),
-        // we lose the write. order matters here.
+        
+        // Log to WAL before returning to prevent write-loss on crash
         wal.log("SET " + p[1] + " " + p[2] + (ttl > 0 ? " " + to_string(ttl) : ""));
         return "+OK\r\n";
     }
@@ -68,6 +72,7 @@ string handleCommand(Store &db, WAL &wal, const string &raw)
         string val = db.get(p[1]);
         if (val == "(nil)")
             return "$-1\r\n";
+            
         // RESP format: $<length>\r\n<value>\r\n
         return "$" + to_string(val.size()) + "\r\n" + val + "\r\n";
     }
@@ -79,7 +84,7 @@ string handleCommand(Store &db, WAL &wal, const string &raw)
         int n = db.del(p[1]);
         if (n > 0)
             wal.log("DEL " + p[1]);
-        return ":" + to_string(n) + "\r\n"; // n not db.del() again — key is already gone
+        return ":" + to_string(n) + "\r\n"; 
     }
 
     if (cmd == "DBSIZE")
@@ -88,7 +93,7 @@ string handleCommand(Store &db, WAL &wal, const string &raw)
     return "-ERR unknown command '" + p[0] + "'\r\n";
 }
 
-void handleClient(int client_fd, Store &db, WAL &wal)
+void handleClient(SOCKET client_fd, Store &db, WAL &wal)
 {
     char buf[1024];
     string leftover;
@@ -98,11 +103,10 @@ void handleClient(int client_fd, Store &db, WAL &wal)
         int n = recv(client_fd, buf, sizeof(buf) - 1, 0);
         if (n <= 0)
             break;
+            
         buf[n] = '\0';
         leftover += buf;
 
-        // TCP doesn't guarantee a full command arrives in one recv() call
-        // buffer everything and split on newlines to get complete commands
         size_t pos;
         while ((pos = leftover.find('\n')) != string::npos)
         {
@@ -122,60 +126,69 @@ void handleClient(int client_fd, Store &db, WAL &wal)
 
 int main()
 {
-    Store db(100000);
-    WAL wal("redis.wal");
-
-    // startup order matters: snapshot first (bulk), then WAL on top (recent changes)
-    loadSnapshot(db, "redis.snap");
-    wal.replay(db);
-
-    cout << "Loaded " << db.size() << " keys from disk.\n";
-
-    // without SO_REUSEADDR, restarting the server within ~60s fails with
-    // "address already in use" because the OS holds the port in TIME_WAIT
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0)
-    {
-        perror("socket");
+    // 1. Initialize Windows Networking Hardware
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        cerr << "[ERROR] Winsock initialization failed.\n";
         return 1;
     }
 
+    Store db(100000);
+    WAL wal("server_log.wal");
+
+    // 2. Load Red-Black Tree persistence and replay WAL
+    loadFromDisk(db, "database_state.dat");
+    wal.replay(db);
+
+    cout << "[INFO] Loaded " << db.size() << " keys from disk into Red-Black Tree.\n";
+
+    // 3. Create Windows Socket
+    SOCKET server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == INVALID_SOCKET)
+    {
+        cerr << "[ERROR] Socket creation failed.\n";
+        WSACleanup();
+        return 1;
+    }
+
+    // SO_REUSEADDR prevents "address already in use" errors on rapid restarts
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(PORT);
 
-    if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) < 0)
+    if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
     {
-        perror("bind");
+        cerr << "[ERROR] Port bind failed.\n";
+        closesocket(server_fd);
+        WSACleanup();
         return 1;
     }
 
     listen(server_fd, 10);
-    cout << "Mini Redis listening on port " << PORT << "...\n";
+    cout << "[INFO] redisClone server listening on port " << PORT << "...\n";
 
+    // 4. Main Event Loop
     while (true)
     {
         sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
+        int client_len = sizeof(client_addr);
 
-        int client_fd = accept(server_fd, (sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0)
+        SOCKET client_fd = accept(server_fd, (sockaddr *)&client_addr, &client_len);
+        if (client_fd == INVALID_SOCKET)
             continue;
 
-        // one thread per client — simple and correct for this scale
-        // downside: 10k clients = 10k threads = bad
-        // proper fix would be a fixed thread pool with a job queue
-        thread([client_fd, &db, &wal]()
-               {
-    handleClient(client_fd, db, wal);
-    close(client_fd); })
-            .detach();
+        // Spawn a detached thread for every incoming client connection
+        thread([client_fd, &db, &wal]() {
+            handleClient(client_fd, db, wal);
+            closesocket(client_fd); 
+        }).detach();
     }
 
-    close(server_fd);
+    closesocket(server_fd);
+    WSACleanup();
     return 0;
 }
